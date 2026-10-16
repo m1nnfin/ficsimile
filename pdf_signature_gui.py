@@ -286,10 +286,20 @@ def _get_page_tables_bboxes(page: fitz.Page) -> Optional[list[fitz.Rect]]:
     tables_obj = _get_page_tables(page)
     if tables_obj is None:
         return None
+    # find_tables() возвращает координаты в системе НЕПОВЁРНУТОЙ страницы
+    # (derotation-пространство). На повёрнутых листах (A3 / альбомные
+    # форматы с page.rotation=90) эти координаты переводятся в реальную
+    # систему координат страницы через page.derotation_matrix — иначе
+    # рамки таблиц (и все последующие расчёты позиции подписи) оказываются
+    # смещены, и подпись встаёт «левее, чем нужно».
+    dmat = page.derotation_matrix
     bboxes: list[fitz.Rect] = []
     for tab in tables_obj.tables:
         try:
-            bboxes.append(fitz.Rect(tab.bbox) & page.rect)
+            r = fitz.Rect(tab.bbox)
+            if getattr(page, "rotation", 0) % 360 != 0:
+                r = r * dmat
+            bboxes.append(r & page.rect)
         except Exception:
             continue
     logger.info("На странице найдено таблиц: %d", len(bboxes))
@@ -500,6 +510,16 @@ def _get_cell_lines(page: fitz.Page) -> Optional[tuple[list[float], list[float]]
     ys: set[float] = set()
 
     # --- Источник 1: сетка таблиц find_tables (координаты строк/столбцов) ---
+    # ВАЖНО: get_drawings(), get_text(...) и вставка изображений работают в
+    # реальной системе координат ПОВЁРНУТОЙ страницы (page.rect), а
+    # find_tables() — в системе неповёрнутой. На повёрнутых листах
+    # (rotation=90/270 — типично для A3/A4 альбомной ориентации) линии
+    # сетки переводятся в координаты страницы матрицей derotation_matrix;
+    # оси X/Y при этом меняются местами. Без этого границы колонок берутся
+    # из «повёрнутого» пространства и подпись встаёт левее, чем нужно.
+    rotation = getattr(page, "rotation", 0) or 0
+    dmat = page.derotation_matrix if rotation % 360 != 0 else None
+    swap_axes = rotation % 180 == 90  # поворот на 90°/270° — оси меняются
     tables_obj = _get_page_tables(page)
     if tables_obj is not None:
         for tab in tables_obj.tables:
@@ -510,8 +530,24 @@ def _get_cell_lines(page: fitz.Page) -> Optional[tuple[list[float], list[float]]
                 txs, tys = _table_grid_lines(tab)
                 colx = [x for x in txs if x not in ("", None)]
                 rowy = tys
-            xs.update(_normalize_line_value(x) for x in colx)
-            ys.update(_normalize_line_value(y) for y in rowy)
+            if dmat is None:
+                xs.update(_normalize_line_value(x) for x in colx)
+                ys.update(_normalize_line_value(y) for y in rowy)
+            else:
+                for x in colx:      # вертикальная линия x=const
+                    p = fitz.Point(float(x), 0.0) * dmat
+                    q = fitz.Point(float(x), 1.0) * dmat
+                    if swap_axes:    # в повёрнутой системе она горизонтальна
+                        ys.add(_normalize_line_value((p.y + q.y) / 2.0))
+                    else:
+                        xs.add(_normalize_line_value((p.x + q.x) / 2.0))
+                for y in rowy:      # горизонтальная линия y=const
+                    p = fitz.Point(0.0, float(y)) * dmat
+                    q = fitz.Point(1.0, float(y)) * dmat
+                    if swap_axes:
+                        xs.add(_normalize_line_value((p.x + q.x) / 2.0))
+                    else:
+                        ys.add(_normalize_line_value((p.y + q.y) / 2.0))
 
     # --- Источник 2: векторные рамки get_drawings (резерв/дополнение) ---
     if (not xs or not ys) and hasattr(page, "get_drawings"):
@@ -578,6 +614,9 @@ def _get_cell_lines(page: fitz.Page) -> Optional[tuple[list[float], list[float]]
     result = (xs, ys)
     try:
         page._cell_lines_cache = result
+        # Горизонтальные линии отдельно (для ограничения колонок зоной
+        # штампа в эвристиках поиска колонки «Подпись»)
+        page._cell_ys_cache = ys
     except Exception:
         pass
     # Диагностика: координаты всех найденных линий сетки штампа — в лог
@@ -733,9 +772,28 @@ def _is_cell_empty(page: fitz.Page, cell: fitz.Rect) -> bool:
     except Exception:
         return False
     if text:
-        logger.debug("Ячейка (%.1f; %.1f) содержит текст '%s' — занята",
-                     cell.x0, cell.y0, text[:40])
-        return False
+        # Текст ЧАСТИЧНО наложенного rect'а (соседние строки/колонки) —
+        # не признак занятости: учитываем только слова, чей центр лежит
+        # ВНУТРИ ячейки. Иначе выносные элементы соседних ячеек (дефисы,
+        # доли единиц, буквы) делали пустую колонку «Подпись» «занятой»,
+        # срабатывало резервное позиционирование и подпись вставалась
+        # левее, чем нужно.
+        words = []
+        for w in page.get_text("words"):
+            wx = (w[0] + w[2]) / 2.0
+            wy = (w[1] + w[3]) / 2.0
+            if cell.x0 - 1.0 <= wx <= cell.x1 + 1.0 \
+                    and cell.y0 - 1.0 <= wy <= cell.y1 + 1.0:
+                words.append(w)
+        if not words:
+            logger.debug("Ячейка (%.1f; %.1f): перекрывающийся текст '%s' "
+                         "лежит вне её центра — ячейка считается пустой",
+                         cell.x0, cell.y0, text[:40])
+        else:
+            logger.debug("Ячейка (%.1f; %.1f) содержит текст '%s' — занята",
+                         cell.x0, cell.y0,
+                         " ".join(w[4] for w in words)[:40])
+            return False
     # Проверка графических объектов внутри ячейки (подписи-картинки, линии
     # подписей от руки), не считая самих рамок ячейки
     cell_area = max(inner.width * inner.height, 1.0)
@@ -1039,6 +1097,78 @@ def _find_signature_column_cell(
     return None, "no_cell"
 
 
+def _limit_xs_to_stamp_band(page: fitz.Page, xs: list[float]
+                            ) -> list[float]:
+    """Ограничивает X-линии сетки зоной штампа (низ/правый край листа).
+
+    Линии собираются со ВСЕЙ страницы (все таблицы), а колонку «Подпись»
+    нужно искать среди границ ЯЧЕЕК САМОГО ШТАМПА. Иначе на страницах с
+    дополнительными таблицами выше/левее штампа границы их колонок
+    искажают поиск ячейки даты и fallback по правой границе — подпись
+    встаёт левее, чем нужно. Вертикальная линия учитывается только если
+    она реально пересекает горизонтальные линии нижней зоны страницы;
+    если отфильтровать нечего — возвращается исходный список.
+    """
+    if not xs:
+        return xs
+    ys = getattr(page, "_cell_ys_cache", None) or []
+    band_y0 = STAMP_ZONE_BOTTOM_RATIO * page.rect.height - 60.0
+    near = [y for y in ys if y >= band_y0]
+    if len(near) < 2:
+        return xs
+    lo, hi = min(near) - 3.0, max(near) + 3.0
+    kept: list[float] = []
+    try:
+        drawings = page.get_drawings(clip=fitz.Rect(0, lo,
+                                                    page.rect.x1, hi))
+    except Exception:
+        return xs
+    vseg: list[tuple[float, float, float]] = []
+    for item in drawings:
+        for seg in item.get("items", ()):
+            if not isinstance(seg, (list, tuple)) or len(seg) != 3:
+                continue
+            itype, p1, p2 = seg
+            if itype != "l":
+                continue
+            try:
+                x1_, y1_ = p1.x, p1.y
+                x2_, y2_ = p2.x, p2.y
+            except AttributeError:
+                x1_, y1_ = p1[0], p1[1]
+                x2_, y2_ = p2[0], p2[1]
+            if abs(x2_ - x1_) < 0.6 and abs(y2_ - y1_) >= 5.0:
+                vseg.append(((x1_ + x2_) / 2.0, min(y1_, y2_),
+                             max(y1_, y2_)))
+    for x in xs:
+        hit = False
+        for vx, vy0, vy1 in vseg:
+            if abs(vx - x) <= 2.5 and vy0 <= hi and vy1 >= lo:
+                hit = True
+                break
+        if not hit:
+            # малые формы get_drawings могут не покрыть всю линию —
+            # дополнительно проверяем замкнутые контуры (rect'ы рамок)
+            for item in drawings:
+                r = item.get("rect")
+                if r is None:
+                    continue
+                if (abs(r.x0 - x) <= 2.5 or abs(r.x1 - x) <= 2.5) \
+                        and r.y0 <= hi and r.y1 >= lo \
+                        and r.width >= 5.0 and r.height >= 5.0:
+                    hit = True
+                    break
+        if hit:
+            kept.append(x)
+    if len(kept) >= 2:
+        if len(kept) != len(xs):
+            logger.debug("Границы колонок ограничены зоной штампа: %d -> "
+                         "%d линий (%s)", len(xs), len(kept),
+                         ["%.1f" % v for v in kept])
+        return kept
+    return xs
+
+
 def _find_sig_column_by_date(
     page: fitz.Page,
     xs: list[float],
@@ -1202,6 +1332,15 @@ def _find_signature_column_x_by_header(
         если заголовок или границы колонки найти не удалось.
     """
     # --- Поиск заголовка колонки ---
+    # Границы колонок (xs) могут быть уже ограничены зоной штампа — в этом
+    # случае заголовок ищем на уровне этих линий; иначе — в нижней части
+    # страницы (шапка штампа всегда внизу).
+    band_y0 = STAMP_ZONE_BOTTOM_RATIO * page.rect.height - 60.0
+    ys_cache = getattr(page, "_cell_ys_cache", None) or []
+    near_ys = [y for y in ys_cache if y >= band_y0]
+    header_zone_y0 = (min(near_ys) - 80.0) if len(near_ys) >= 2 \
+        else 0.5 * page.rect.height
+
     # Собираем вхождения ВСЕХ вариантов («Подпись», «Подписи», «Подп.»...),
     # затем выбираем самое длинное: search_for("Подп") матчит и префикс
     # слова «Подпись», поэтому короткое укороченное rect'овое вхождение не
@@ -1218,10 +1357,12 @@ def _find_signature_column_x_by_header(
             continue
         logger.debug("Заголовок '%s': %d вход.(ий) на странице",
                      term, len(hits))
-        # Только вхождения в нижней части страницы (шапка штампа всегда внизу)
-        stamp_hits = [h for h in hits if h.y0 > 0.5 * page.rect.height] or hits
+        # Только вхождения в зоне штампа (заголовок колонки находится в
+        # шапке таблицы штампа; такие же слова в основном тексте или
+        # колонтитулах выше игнорируются)
+        zone_hits = [h for h in hits if h.y0 >= header_zone_y0] or hits
         # Среди них — самое широкое (длинное слово даёт больший rect)
-        longest = max(stamp_hits, key=lambda r: r.width)
+        longest = max(zone_hits, key=lambda r: r.width)
         if len(term) > best_term_len:
             best_term_len = len(term)
             header_rect = longest
@@ -1333,6 +1474,11 @@ def _find_signature_column_x(
     if len(xs) < 2:
         logger.debug("Колонка «Подпись»: нет линий сетки/таблиц для границ")
         return None
+
+    # Колонку «Подпись» ищем среди границ ЯЧЕЕК ШТАМПА (низ/правый край
+    # листа): линии, собранные с других таблиц страницы выше/левее,
+    # дают ложные границы ячеек — подпись вставалась левее, чем нужно.
+    xs = _limit_xs_to_stamp_band(page, xs)
 
     # --- Метод 1: заголовок «Подпись» (канонический) ---
     result = _find_signature_column_x_by_header(page, xs, source)
@@ -1482,18 +1628,22 @@ def _compute_insert_rect(rect: fitz.Rect, cell_right: Optional[float],
         fitz.Rect для вставки; пустой Rect, если место выходит за правый
         край страницы (вызывающий код пропустит его с предупреждением).
     """
-    # ЭВРИСТИЧЕСКАЯ ЗАЩИТА ОТ «ПЕРЕВЁРНУТЫХ» СЛОЕВ (Сбой: подписи выходили
-    # перевёрнутыми на 90° прямо поверх фамилии).
-    # Если в PDF есть слой, повёрнутый на 90°, PyMuPDF может вернуть блок
-    # текста с «переставленными» осями: очень узкий по X и высокий по Y.
-    # Нормальная строка фамилии широкая и низкая; перевёрнутый блок — наоборот.
-    # В таком случае считаем, что горизонталь/вертикаль перепутаны местами,
-    # и меняем их, чтобы якорь «правый край фамилии + 5 мм» считался по
-    # фактическому направлению чтения текста, а не по оси слоя.
+    # ЗАЩИТА ОТ ОШИБОК КООРДИНАТНОГО ПРЕОБРАЗОВАНИЯ (Сбой: подписи выходили
+    # перевёрнутыми на 90° прямо поверх фамилии; раньше здесь «переставляли»
+    # оси любого высокого узкого блока).
+    # Настоящий текст фамилии в штампе — ГОРИЗОНТАЛЬНАЯ строка: даже одна
+    # буква («И.О.») шире, чем высота строки. Блок с высотой больше удвоенной
+    # ширины может означать ТОЛЬКО сбой преобразования координат (смешение
+    # систем неповёрнутой/повёрнутой страницы), а не «узкий столбец» из-за
+    # малого формата листа: масштаб листа не меняет пропорций текстовых
+    # строк. Такой блок нормализуем перестановкой осей; корректные горизонтальные
+    # блоки трогается никогда — именно они на нестандартных форматах раньше
+    # искажались и уводили подпись левее нужного места.
     if (rect is not None and not rect.is_empty and rect.width > 0
             and rect.height > 0 and rect.height > rect.width * 2.0):
-        logger.warning("Блок фамилии имеет признаки перевёрнутого слоя "
-                       "(высота %.1f pt >> ширина %.1f pt) — оси нормализованы",
+        logger.warning("Блок фамилии вертикальный (высота %.1f pt > 2×ширины "
+                       "%.1f pt) — признаки сбоя координат при повороте "
+                       "страницы; оси нормализованы",
                        rect.height, rect.width)
         rect = fitz.Rect(rect.y0, rect.x0, rect.y1, rect.x1)
 
@@ -1705,6 +1855,33 @@ def find_stamp_cells(
     # Линии сетки штампа — один раз на страницу (нужны даже при наличии
     # find_tables: bounding box таблицы не даёт границ отдельных ячеек)
     grid_lines = _get_cell_lines(page)
+
+    # САМОПРОВЕРКА КООРДИНАТНОЙ СИСТЕМЫ СЕТКИ (устойчивость к нестандартным
+    # форматам и повёрнутым страницам). get_drawings()/get_text() возвращают
+    # линии уже в координатах реальной страницы; если же источник —
+    # find_tables() на странице с rotation != 0, оси могли остаться в
+    # «повёрнутой» системе. Проверяем по фактическому расположению таблиц/
+    # текста: если горизонтальные линии сетки выходят за реальные границы
+    # таблиц, а вертикальные укладываются — оси перепутаны местами, меняем
+    # их обратно. Без этого границы колонок смещаются, колонка «Подпись»
+    # определяется неверно и подпись встаёт левее, чем нужно.
+    if (grid_lines and table_bboxes
+            and getattr(page, "rotation", 0) % 180 == 90):
+        gxs, gys = grid_lines
+        tb_x0 = min(tb.x0 for tb in table_bboxes)
+        tb_x1 = max(tb.x1 for tb in table_bboxes)
+        tb_y0 = min(tb.y0 for tb in table_bboxes)
+        tb_y1 = max(tb.y1 for tb in table_bboxes)
+        xs_ok = bool(gxs) and all(tb_x0 - 5.0 <= x <= tb_x1 + 5.0
+                                  for x in gxs)
+        ys_ok = bool(gys) and all(tb_y0 - 5.0 <= y <= tb_y1 + 5.0
+                                  for y in gys)
+        if not ys_ok and xs_ok:
+            logger.warning("Сетка штампа задана в повёрнутой системе "
+                           "координат (rotation=%d) — оси X/Y сетки "
+                           "переставлены для корректного позиционирования",
+                           page.rotation)
+            grid_lines = (gys, gxs)
 
     # Колонка «Подпись» ищется ПО ЗАГОЛОВКУ в шапке штампа — один раз на
     # страницу. Это надёжнее «ближайшей линии справа от фамилии»: фамилия
