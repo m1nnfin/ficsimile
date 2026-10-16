@@ -92,20 +92,21 @@ OFFSET_RIGHT_PT = 3.0
 # тогда подпись ставится сразу после текста с этим отступом.
 NAME_GAP_MIN_PT = 8.0
 
-# Целевой зазор между ПРАВЫМ КРАЕМ ТЕКСТА фамилии и левым краем подписи, мм.
-# Требуемое поведение: подпись появляется в SIGNATURE_GAP_FROM_NAME_MM
-# миллиметрах справа от фамилии. Это главный (приоритетный) критерий
-# горизонтального позиционирования; центрирование в ячейке «Подпись»
-# допускается только если оно не уводит подпись дальше MAX_SIG_CELL_DEV_MM
-# мм от этой точки (иначе ячейка распознана неверно/охватывает несколько
-# колонок — её геометрия игнорируется).
-SIGNATURE_GAP_FROM_NAME_MM = 5.0
-SIGNATURE_GAP_FROM_NAME_PT = SIGNATURE_GAP_FROM_NAME_MM * MM_TO_PT  # ≈14.17 pt
+# Отступ левого края подписи от ЛЕВОЙ ГРАНИЦЫ ячейки колонки «Подпись», мм.
+# Требуемое поведение: подпись ставится ВНУТРЬ соседней колонки штампа
+# («Подпись»), расположенной в той же строке напротив фамилии, а НЕ просто
+# «в 5 мм справа от текста». Текст фамилии может занимать лишь малую часть
+# широкой ячейки (колонки «Лист»/«№ док.»), поэтому якорь «конец текста +
+# зазор» уводил картинку в служебные колонки или на границы сетки.
+SIG_CELL_INSET_LEFT_MM = 2.0
+SIG_CELL_INSET_LEFT_PT = SIG_CELL_INSET_LEFT_MM * MM_TO_PT  # ≈5.67 pt
 
-# Максимальное допустимое отклонение от точки «фамилия + 5 мм» при
-# использовании центрирования по ячейке, мм.
-MAX_SIG_CELL_DEV_MM = 3.0
-MAX_SIG_CELL_DEV_PT = MAX_SIG_CELL_DEV_MM * MM_TO_PT  # ≈8.50 pt
+# Максимальный зазор между ПРАВЫМ КРАЕМ ТЕКСТА фамилии и левым краем
+# подписи при резервном позиционировании (когда колонка «Подпись» не
+# распознана), мм. Подпись ставится сразу после фамилии, но не дальше
+# этого предела — чтобы картинка гарантированно стояла «напротив» строки.
+SIGNATURE_MAX_GAP_FROM_NAME_MM = 12.0
+SIGNATURE_MAX_GAP_FROM_NAME_PT = SIGNATURE_MAX_GAP_FROM_NAME_MM * MM_TO_PT
 
 # Горизонтальное пересечение соседних строк текста, при котором они
 # считаются ЧАСТЬЮ ОДНОЙ ячейки (строка «И.О. Фамилия» может печататься
@@ -946,6 +947,12 @@ def _find_signature_column_cell(
     target = _find_signature_cell(block, name_cell, grid_lines)
     if target is not None and target.width >= 3.0 \
             and target.height >= 3.0:
+        # Целевая ячейка должна находиться ПРАВЕЙ текста фамилии (колонка
+        # «Подпись» напротив строки). Если следующая по сетке ячейка ещё
+        # перекрывает блок фамилии — это внутренняя граница широкой/
+        # объединённой ячейки с ФИО («Лист», «№ док.»): подпись в неё
+        # ставить нельзя — она окажется не в колонке «Подпись».
+        right_of_name = target.x0 >= block.x1 - 1.0
         # СТРОГАЯ ПРОВЕРКА «ТА ЖЕ СТРОКА» (требование 6): ячейка из Шага 1
         # принимается только если её вертикальный центр лежит на уровне
         # центра блока фамилии (в пределах 0.6 высоты строки). Иначе —
@@ -959,16 +966,18 @@ def _find_signature_column_cell(
         empty = _is_cell_empty(page, target)
         logger.info("Целевая ячейка «Подпись» (следующая по сетке): "
                     "(%.1f; %.1f)-(%.1f; %.1f), ширина %.1f pt, пустая=%s, "
-                    "та же строка=%s",
+                    "та же строка=%s, правее фамилии=%s",
                     target.x0, target.y0, target.x1, target.y1,
-                    target.width, empty, same_row)
-        if empty and same_row:
+                    target.width, empty, same_row, right_of_name)
+        if empty and same_row and right_of_name:
             return target, ""
 
     # --- Шаг 2: резервный перебор соседних ячеек вправо (до 3) ---
     row_top, row_bottom = _row_bounds(block, grid_lines, name_cell)
     if row_top is None or row_bottom is None:
-        return (target, "") if target is not None else (None, "no_cell")
+        if target is not None and target.x0 >= block.x1 - 1.0:
+            return (target, "")
+        return (None, "no_cell")
 
     # Защита от multi-row ячеек: если найденные границы строки охватывают
     # больше одной реальной строки штампа (высота > 2× высоты подписи),
@@ -986,9 +995,11 @@ def _find_signature_column_cell(
     col_cands = [x for x in xs if row_top - 0.5 <= x <= row_bottom + 0.5]
     col_cands = sorted(set(col_cands))
 
-    # Перебираем ячейки, начинающиеся не левее правой границы ячейки имени
-    # (допуск 1 pt на разброс линий), идём вправо до 3 ячеек.
-    start_x = name_cell.x1 - 1.0
+    # Перебираем ячейки, начинающиеся не левее ПРАВОГО КРАЯ ТЕКСТА фамилии
+    # (допуск 1 pt на разброс линий), идём вправо до 3 ячеек. Отсечка по
+    # тексту, а не по границе ячейки с ФИО, важна для широких/объединённых
+    # ячеек: внутренние границы такой ячейки («Лист», «№ док.») — не целевые.
+    start_x = max(name_cell.x1 - 1.0, block.x1 - 1.0)
     idxs = [i for i, x in enumerate(col_cands) if x >= start_x]
     for i in idxs[:3]:
         if i + 1 >= len(col_cands):
@@ -1020,8 +1031,10 @@ def _find_signature_column_cell(
             return cand, ""
 
     # Ни одна подходящая пустая ячейка не найдена — возвращаем первую
-    # найденную по сетке (будет проведено резервное позиционирование)
-    if target is not None:
+    # найденную по сетке (будет проведено резервное позиционирование),
+    # но только если она реально лежит правее текста фамилии (иначе это
+    # внутренняя граница широкой ячейки с ФИО — подпись в неё не ставится)
+    if target is not None and target.x0 >= block.x1 - 1.0:
         return None, "occupied"
     return None, "no_cell"
 
@@ -1435,18 +1448,23 @@ def _compute_insert_rect(rect: fitz.Rect, cell_right: Optional[float],
                          ) -> fitz.Rect:
     """Вычисляет прямоугольник вставки подписи для вхождения фамилии.
 
-    Горизонтальное позиционирование (новое требуемое поведение):
-      Подпись ставится СТРОГО В SIGNATURE_GAP_FROM_NAME_MM (5 мм) СПРАВА ОТ
-      ПРАВОГО КРАЯ ТЕКСТА фамилии: x0 = rect.x1 + SIGNATURE_GAP_FROM_NAME_PT.
-      Это главный якорь по горизонтали. Центрирование по распознанной ячейке
-      «Подпись» (target_cell) допускается только как корректировка: если центр ячейки
-      находится в пределах MAX_SIG_CELL_DEV_MM (3 мм) от точки «фамилия+5 мм»,
-      подпись центрируется по ячейке (она всё равно окажется рядом с фамилией);
-      иначе геометрия ячейки игнорируется (ячейка распознана неверно или
-      охватывает несколько колонок — из-за этого подписи и «убегали» слишком
-      далеко от фамилии). Резервные варианты cell_right + OFFSET_RIGHT_PT и
-      конец текста + NAME_GAP_MIN_PT сохранены для обратной совместимости,
-      когда блок фамилии недоступен.
+    Горизонтальное позиционирование (требуемое поведение — «подпись в
+    соседней колонке напротив фамилии»):
+      1. Если целевая ячейка колонки «Подпись» распознана (target_cell) —
+         подпись ставится ВНУТРЬ неё: x0 = target_cell.x0 + отступ слева
+         SIG_CELL_INSET_LEFT_PT (если ширина ячейки позволяет целиком
+         разместить картинку без выезда за её правую границу). Это главный
+         приоритет: картинка гарантированно попадает именно в колонку
+         «Подпись» той же строки, что и фамилия. Раньше этот вариант
+         отсекался проверкой «центр ячейки в 3 мм от точки фамилия+5 мм» и
+         подпись уезжала в служебные колонки («Лист», «№ док.») прямо после
+         текста фамилии — именно это воспринималось как «картинки вставляются
+         куда угодно, но не туда».
+      2. Если ячейка не распознана — резерв: правая граница ячейки с
+         фамилией (cell_right) + OFFSET_RIGHT_PT, при этом позиция не должна
+         отстоять от конца текста фамилии дальше SIGNATURE_MAX_GAP_FROM_NAME_PT.
+      3. Крайний резерв: сразу после текста фамилии + NAME_GAP_MIN_PT либо
+         правый край страницы (когда блок фамилии недоступен).
 
     Вертикальное позиционирование:
       Якорь — центр блока фамилии (rect); подпись центрируется напротив своей
@@ -1458,8 +1476,7 @@ def _compute_insert_rect(rect: fitz.Rect, cell_right: Optional[float],
         cell_right: X правой границы ячейки с фамилией (резервный вариант).
         page_width, page_height: размеры страницы.
         cell_bottom, cell_top: границы строки таблицы (резервный вариант).
-        target_cell: целевая ячейка колонки «Подпись» (центрирование только
-            вблизи якоря «фамилия + 5 мм»).
+        target_cell: целевая ячейка колонки «Подпись» (главный ориентир).
 
     Returns:
         fitz.Rect для вставки; пустой Rect, если место выходит за правый
@@ -1486,13 +1503,32 @@ def _compute_insert_rect(rect: fitz.Rect, cell_right: Optional[float],
     valid_name_block = (rect is not None and not rect.is_empty
                         and rect.width > 0 and rect.height > 0)
 
-    # --- Горизонталь: главный якорь — «правый край фамилии + 5 мм» ------
-    used_method = "gap_from_name"
-    if valid_name_block:
-        x0 = rect.x1 + SIGNATURE_GAP_FROM_NAME_PT
+    # --- Горизонталь -------------------------------------------------------
+    used_method = ""
+    x0: float
+
+    # Приоритет 1: подпись ВНУТРЬ распознанной ячейки колонки «Подпись»
+    # той же строки, что и фамилия (отступ слева от границы ячейки).
+    if target_cell is not None and not target_cell.is_empty \
+            and target_cell.width >= w + 2.0 * SIG_CELL_INSET_LEFT_PT:
+        x0 = target_cell.x0 + SIG_CELL_INSET_LEFT_PT
+        used_method = "sig_cell_inset"
+    elif valid_name_block:
+        # Приоритет 2/3 (резерв): сразу после текста/ячейки фамилии, но не
+        # дальше максимального зазора — иначе картинка уезжала в соседние
+        # служебные колонки («куда угодно, но не напротив фамилии»).
+        gap_x0 = rect.x1 + NAME_GAP_MIN_PT
+        cand_x0 = gap_x0
+        if cell_right is not None and cell_right + OFFSET_RIGHT_PT > cand_x0:
+            cand_x0 = cell_right + OFFSET_RIGHT_PT
+            used_method = "cell_right"
+        else:
+            used_method = "gap_from_name"
+        max_x0 = rect.x1 + SIGNATURE_MAX_GAP_FROM_NAME_PT
+        x0 = min(cand_x0, max_x0)
     elif target_cell is not None and not target_cell.is_empty:
         # Обратная совместимость: блок фамилии недоступен — центрируем
-        # по ячейке «Подпись» (старое поведение варианта 1)
+        # по ячейке «Подпись»
         x0 = target_cell.x0 + (target_cell.width - w) / 2.0
         used_method = "sig_cell_centered_no_block"
     elif cell_right is not None:
@@ -1501,25 +1537,9 @@ def _compute_insert_rect(rect: fitz.Rect, cell_right: Optional[float],
     else:
         x0 = page_width - w - OFFSET_RIGHT_PT
         used_method = "page_edge"
-
-    # Требование: подпись стоит в 5 мм СПРАВА ОТ ФАМИЛИИ — центрирование
-    # по ячейке «Подпись» НЕ применяется, если из-за этого подпись убегает
-    # далеко от фамилии. Если же ячейка расположена вплотную к фамилии
-    # (её центр в пределах MAX_SIG_CELL_DEV_MM от точки «фамилия+5 мм»),
-    # оставляем аккуратное центрирование по ячейке.
-    if valid_name_block and target_cell is not None and not target_cell.is_empty:
-        gap_x0 = rect.x1 + SIGNATURE_GAP_FROM_NAME_PT
-        cell_center_x = target_cell.x0 + target_cell.width / 2.0
-        name_center_target = gap_x0 + w / 2.0
-        if abs(cell_center_x - name_center_target) <= MAX_SIG_CELL_DEV_PT:
-            x0 = target_cell.x0 + (target_cell.width - w) / 2.0
-            used_method = "sig_cell_centered"
     logger.debug("Горизонтальный якорь подписи: метод=%s, "
-                 "x_конец_фамилии=%.1f, x0_подписи=%.1f (зазор %.1f pt "
-                 "= %.2f мм)", used_method,
-                 rect.x1 if valid_name_block else float('nan'), x0,
-                 (x0 - rect.x1) if valid_name_block else float('nan'),
-                 ((x0 - rect.x1) / MM_TO_PT) if valid_name_block else float('nan'))
+                 "x_конец_фамилии=%.1f, x0_подписи=%.1f", used_method,
+                 rect.x1 if valid_name_block else float('nan'), x0)
 
     # --- Вертикаль: якорь — центр строки фамилии ------------------------
     anchor_y = ((rect.y0 + rect.y1) / 2.0 if valid_name_block
